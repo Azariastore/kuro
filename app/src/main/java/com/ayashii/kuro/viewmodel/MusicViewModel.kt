@@ -475,12 +475,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-                // Prefer offline local file when available
+                // Prefer offline file (public Music/Kuro) when available
                 val offlinePath = downloadManager.getLocalPath(track.id)
-                if (!offlinePath.isNullOrBlank() && java.io.File(offlinePath).exists()) {
+                val offlineUri = downloadManager.getMediaUri(track.id)
+                val offlineFileExists = !offlinePath.isNullOrBlank() && java.io.File(offlinePath).exists()
+                if (offlineFileExists || offlineUri != null) {
+                    val playUri: Uri = when {
+                        offlineFileExists -> Uri.fromFile(java.io.File(offlinePath!!))
+                        else -> offlineUri!!
+                    }
                     val localTrack = track.copy(
                         localPath = offlinePath,
-                        streamUrl = offlinePath,
+                        streamUrl = playUri.toString(),
                         mimeType = "audio/mp4"
                     )
                     _currentTrack.value = localTrack
@@ -494,7 +500,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                             .build()
                         val mediaItem = MediaItem.Builder()
                             .setMediaId(localTrack.id)
-                            .setUri(Uri.fromFile(java.io.File(offlinePath)))
+                            .setUri(playUri)
                             .setMimeType("audio/mp4")
                             .setMediaMetadata(mediaMetadata)
                             .build()

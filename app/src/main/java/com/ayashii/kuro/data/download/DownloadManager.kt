@@ -2,9 +2,13 @@ package com.ayashii.kuro.data.download
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import com.ayashii.kuro.data.model.Track
 import com.ayashii.kuro.data.remote.MusicRepository
@@ -24,17 +28,23 @@ import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 /**
- * Manages offline audio downloads (M4A) into app-private internal storage.
- * Files live under filesDir/music_downloads/{trackId}.m4a
- * Metadata is persisted in SharedPreferences.
+ * Downloads audio (M4A) to the **public** Music/Kuro folder so users can
+ * browse and copy files from any file manager.
+ *
+ * Path (typical):
+ *   /storage/emulated/0/Music/Kuro/{Artist} - {Title}.m4a
+ *
+ * Uses MediaStore on Android 10+ (no special storage permission needed to write).
+ * Metadata is still tracked in SharedPreferences for the in-app Downloads tab.
  */
 class DownloadManager private constructor(private val context: Context) {
 
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
-    private val downloadDir: File =
-        File(context.filesDir, "music_downloads").also { if (!it.exists()) it.mkdirs() }
+    /** App cache used only as temporary download buffer. */
+    private val tempDir: File =
+        File(context.cacheDir, "download_tmp").also { if (!it.exists()) it.mkdirs() }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -58,7 +68,6 @@ class DownloadManager private constructor(private val context: Context) {
 
     init {
         createNotificationChannel()
-        // Clean up orphaned metadata (file missing)
         cleanupMissingFiles()
     }
 
@@ -70,13 +79,23 @@ class DownloadManager private constructor(private val context: Context) {
         return _downloadedTracks.value.find { it.id == trackId }?.localPath
     }
 
+    /** Content URI (MediaStore) for playback when file path is unavailable. */
+    fun getMediaUri(trackId: String): Uri? {
+        val s = prefs.getString(KEY_URI_PREFIX + trackId, null) ?: return null
+        return try {
+            Uri.parse(s)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun getDownloadedTrack(trackId: String): Track? {
         return _downloadedTracks.value.find { it.id == trackId }
     }
 
     /**
-     * Download audio-only M4A (prefer ~256 kbps) into internal storage.
-     * Returns the updated Track with localPath on success, null on failure/cancel.
+     * Download audio-only M4A into public Music/Kuro folder.
+     * Returns the updated Track with localPath on success, null on failure.
      */
     suspend fun downloadTrack(
         track: Track,
@@ -94,16 +113,14 @@ class DownloadManager private constructor(private val context: Context) {
         updateProgress(track.id, 0f)
         showProgressNotification(track, 0, indeterminate = true)
 
+        val tempFile = File(tempDir, "${track.id}.m4a.tmp")
+
         try {
-            // Prefer highest available M4A (targets 256 kbps when present)
             val stream = repository.getAudioStreamForDownload(track.url)
                 ?: run {
                     failDownload(track, "Stream not available")
                     return@withContext null
                 }
-
-            val targetFile = File(downloadDir, "${track.id}.m4a")
-            val tempFile = File(downloadDir, "${track.id}.m4a.tmp")
 
             val request = Request.Builder()
                 .url(stream.url)
@@ -142,7 +159,6 @@ class DownloadManager private constructor(private val context: Context) {
                                 val progress = totalRead.toFloat() / contentLength
                                 updateProgress(track.id, progress)
 
-                                // Throttle notification updates
                                 if (percent != lastNotifiedPercent && percent % 2 == 0) {
                                     lastNotifiedPercent = percent
                                     showProgressNotification(track, percent, indeterminate = false)
@@ -154,20 +170,24 @@ class DownloadManager private constructor(private val context: Context) {
                 }
             }
 
-            // Atomic rename
-            if (targetFile.exists()) targetFile.delete()
-            if (!tempFile.renameTo(targetFile)) {
-                tempFile.copyTo(targetFile, overwrite = true)
-                tempFile.delete()
-            }
+            // Move into public Music/Kuro via MediaStore (or legacy public dir)
+            val saved = saveToPublicMusic(track, tempFile)
+                ?: run {
+                    failDownload(track, "Failed to save to public folder")
+                    return@withContext null
+                }
+
+            tempFile.delete()
 
             val downloaded = track.copy(
-                localPath = targetFile.absolutePath,
-                streamUrl = targetFile.absolutePath,
+                localPath = saved.path,
+                streamUrl = saved.path,
                 mimeType = "audio/mp4"
             )
 
-            saveDownloadedTrack(downloaded)
+            // Keep media store URI in prefs for reliable delete/playback
+            saveDownloadedTrack(downloaded, saved.uriString)
+
             updateProgress(track.id, 1f)
             showCompletedNotification(track)
             downloaded
@@ -176,19 +196,29 @@ class DownloadManager private constructor(private val context: Context) {
             null
         } finally {
             mutex.withLock { activeJobs.remove(track.id) }
-            // Clear progress after a short delay is handled by caller if needed
+            try { tempFile.delete() } catch (_: Exception) {}
         }
     }
 
     suspend fun deleteDownload(trackId: String) = withContext(Dispatchers.IO) {
         val track = getDownloadedTrack(trackId) ?: return@withContext
+        val uriString = prefs.getString(KEY_URI_PREFIX + trackId, null)
+
+        // Delete via MediaStore URI if we have it
+        if (!uriString.isNullOrBlank()) {
+            try {
+                context.contentResolver.delete(Uri.parse(uriString), null, null)
+            } catch (_: Exception) {}
+        }
+
+        // Fallback: delete file path
         track.localPath?.let { path ->
             try {
                 File(path).delete()
             } catch (_: Exception) {}
         }
-        File(downloadDir, "$trackId.m4a").delete()
-        File(downloadDir, "$trackId.m4a.tmp").delete()
+
+        prefs.edit().remove(KEY_URI_PREFIX + trackId).apply()
 
         val updated = _downloadedTracks.value.filter { it.id != trackId }
         saveAll(updated)
@@ -207,10 +237,116 @@ class DownloadManager private constructor(private val context: Context) {
         _progress.value = map
     }
 
+    // ── Public storage ───────────────────────────────────────────
+
+    private data class SavedFile(val path: String, val uriString: String?)
+
+    private fun sanitizeFileName(name: String): String {
+        return name
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(80)
+            .ifBlank { "track" }
+    }
+
+    private fun buildDisplayName(track: Track): String {
+        val artist = sanitizeFileName(track.artist)
+        val title = sanitizeFileName(track.title)
+        return "$artist - $title.m4a"
+    }
+
+    private fun saveToPublicMusic(track: Track, sourceFile: File): SavedFile? {
+        val displayName = buildDisplayName(track)
+        val relativePath = Environment.DIRECTORY_MUSIC + "/Kuro"
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Android 10+: MediaStore → visible in Files / Music apps
+            val values = ContentValues().apply {
+                put(MediaStore.Audio.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                put(MediaStore.Audio.Media.RELATIVE_PATH, relativePath)
+                put(MediaStore.Audio.Media.IS_PENDING, 1)
+                put(MediaStore.Audio.Media.TITLE, track.title)
+                put(MediaStore.Audio.Media.ARTIST, track.artist)
+                if (track.durationSeconds > 0) {
+                    put(MediaStore.Audio.Media.DURATION, track.durationSeconds * 1000)
+                }
+            }
+
+            val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val resolver = context.contentResolver
+            val itemUri = resolver.insert(collection, values) ?: return null
+
+            try {
+                resolver.openOutputStream(itemUri)?.use { out ->
+                    sourceFile.inputStream().use { input -> input.copyTo(out) }
+                } ?: run {
+                    resolver.delete(itemUri, null, null)
+                    return null
+                }
+
+                values.clear()
+                values.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                resolver.update(itemUri, values, null, null)
+
+                // Resolve real filesystem path when possible (for ExoPlayer file:// and user copy)
+                val path = queryMediaStorePath(itemUri)
+                    ?: "/storage/emulated/0/$relativePath/$displayName"
+
+                SavedFile(path = path, uriString = itemUri.toString())
+            } catch (e: Exception) {
+                try { resolver.delete(itemUri, null, null) } catch (_: Exception) {}
+                null
+            }
+        } else {
+            // Android 8–9: direct public Music folder (needs WRITE_EXTERNAL_STORAGE)
+            val musicRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+            val kuroDir = File(musicRoot, "Kuro").also { if (!it.exists()) it.mkdirs() }
+            val dest = File(kuroDir, displayName)
+            sourceFile.copyTo(dest, overwrite = true)
+            // Notify media scanner
+            try {
+                val values = ContentValues().apply {
+                    put(MediaStore.Audio.Media.DATA, dest.absolutePath)
+                    put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                    put(MediaStore.Audio.Media.TITLE, track.title)
+                    put(MediaStore.Audio.Media.ARTIST, track.artist)
+                }
+                val uri = context.contentResolver.insert(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    values
+                )
+                SavedFile(path = dest.absolutePath, uriString = uri?.toString())
+            } catch (_: Exception) {
+                SavedFile(path = dest.absolutePath, uriString = null)
+            }
+        }
+    }
+
+    private fun queryMediaStorePath(uri: Uri): String? {
+        return try {
+            context.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Audio.Media.DATA),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
+                    if (idx >= 0) cursor.getString(idx) else null
+                } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun failDownload(track: Track, reason: String) {
         updateProgress(track.id, -1f)
         showFailedNotification(track, reason)
-        File(downloadDir, "${track.id}.m4a.tmp").delete()
+        File(tempDir, "${track.id}.m4a.tmp").delete()
     }
 
     private fun updateProgress(trackId: String, value: Float) {
@@ -229,7 +365,11 @@ class DownloadManager private constructor(private val context: Context) {
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
                     val path = o.optString("localPath", "")
-                    if (path.isNotBlank() && File(path).exists()) {
+                    val exists = path.isNotBlank() && (
+                        File(path).exists() ||
+                            !prefs.getString(KEY_URI_PREFIX + o.optString("id"), null).isNullOrBlank()
+                        )
+                    if (path.isNotBlank() && exists) {
                         add(
                             Track(
                                 id = o.getString("id"),
@@ -253,7 +393,10 @@ class DownloadManager private constructor(private val context: Context) {
     }
 
     @Synchronized
-    private fun saveDownloadedTrack(track: Track) {
+    private fun saveDownloadedTrack(track: Track, uriString: String? = null) {
+        if (!uriString.isNullOrBlank()) {
+            prefs.edit().putString(KEY_URI_PREFIX + track.id, uriString).apply()
+        }
         val current = _downloadedTracks.value.toMutableList()
         val idx = current.indexOfFirst { it.id == track.id }
         if (idx >= 0) current[idx] = track else current.add(0, track)
@@ -282,7 +425,9 @@ class DownloadManager private constructor(private val context: Context) {
 
     private fun cleanupMissingFiles() {
         val valid = _downloadedTracks.value.filter { t ->
-            t.localPath != null && File(t.localPath).exists()
+            val pathOk = t.localPath != null && File(t.localPath).exists()
+            val uriOk = !prefs.getString(KEY_URI_PREFIX + t.id, null).isNullOrBlank()
+            pathOk || uriOk
         }
         if (valid.size != _downloadedTracks.value.size) {
             saveAll(valid)
@@ -331,7 +476,7 @@ class DownloadManager private constructor(private val context: Context) {
     private fun showCompletedNotification(track: Track) {
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentTitle("Download complete")
-            .setContentText(track.title)
+            .setContentText("${track.title} → Music/Kuro")
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
@@ -351,6 +496,7 @@ class DownloadManager private constructor(private val context: Context) {
     companion object {
         private const val PREF_NAME = "kuro_downloads"
         private const val KEY_DOWNLOADS = "downloaded_tracks"
+        private const val KEY_URI_PREFIX = "media_uri_"
         private const val CHANNEL_ID = "kuro_downloads"
         private const val NOTIFICATION_ID_BASE = 42000
 
