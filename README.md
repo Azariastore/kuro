@@ -1,3 +1,6 @@
+> Add feature download in this app by Azariastore
+
+
 # Kuro (黒) — Minimalist Monochrome Music Streaming
 
 > An ultra-lightweight, zero-bloat music streaming app for Android inspired by Apple Music & Spotify aesthetics, powered by **NewPipeExtractor** and **AndroidX Media3**.
